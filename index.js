@@ -6,7 +6,9 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
-  Events
+  Events,
+  InteractionContextType,
+  ApplicationIntegrationType
 } = require('discord.js');
 const cron = require('node-cron');
 const axios = require('axios');
@@ -764,16 +766,43 @@ async function postDrops(channel, { isSlash = false, skipPosted = false } = {}) 
 }
 
 // ---------- Slash Command ----------
-const commands = [
-  new SlashCommandBuilder()
-    .setName('drops')
-    .setDescription("Show today's verified ETH + Robinhood NFT mints")
-].map(c => c.toJSON());
+const dropsCommand = new SlashCommandBuilder()
+  .setName('drops')
+  .setDescription("Show today's verified ETH + Robinhood NFT mints")
+  .setDefaultMemberPermissions(null);
+
+if (typeof dropsCommand.setContexts === 'function' && InteractionContextType) {
+  dropsCommand.setContexts(InteractionContextType.Guild);
+}
+if (typeof dropsCommand.setIntegrationTypes === 'function' && ApplicationIntegrationType) {
+  dropsCommand.setIntegrationTypes(ApplicationIntegrationType.GuildInstall);
+}
+
+const commands = [dropsCommand.toJSON()];
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
-  log('Slash commands registered');
+
+  let guildId = process.env.GUILD_ID;
+  if (!guildId && process.env.CHANNEL_ID) {
+    try {
+      const channel = await client.channels.fetch(process.env.CHANNEL_ID);
+      guildId = channel.guildId;
+    } catch (err) {
+      logError('Could not resolve guild for slash commands', err);
+    }
+  }
+
+  if (guildId) {
+    await rest.put(
+      Routes.applicationGuildCommands(process.env.CLIENT_ID, guildId),
+      { body: commands }
+    );
+    log(`Slash commands registered for everyone in guild ${guildId}`);
+  } else {
+    log('Slash commands registered globally for everyone');
+  }
 }
 
 async function onReady() {
@@ -792,7 +821,7 @@ client.on('interactionCreate', async interaction => {
   if (interaction.commandName !== 'drops') return;
 
   try {
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: false });
     await postDrops(interaction, { isSlash: true });
   } catch (err) {
     logError('/drops failed', err);
