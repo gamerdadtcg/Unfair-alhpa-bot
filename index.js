@@ -10,7 +10,6 @@ const {
 } = require('discord.js');
 const cron = require('node-cron');
 const axios = require('axios');
-const cheerio = require('cheerio');
 const fs = require('fs');
 const path = require('path');
 
@@ -297,6 +296,19 @@ function dateRangeIncludesToday(text) {
   return today >= start && today <= end;
 }
 
+function calendarRangeIsRelevant(startText, endText) {
+  const start = new Date(startText);
+  const end = new Date(endText);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return false;
+
+  start.setHours(0, 0, 0, 0);
+  end.setHours(23, 59, 59, 999);
+  const now = Date.now();
+  const from = now - MINT_LOOKBACK_HOURS * 36e5;
+  const until = now + MINT_LOOKBACK_HOURS * 36e5;
+  return start.getTime() <= until && end.getTime() >= from;
+}
+
 function normalizeDrop(drop) {
   const stages = allStages(drop);
   const relevant = stages.filter(stageIsRelevant);
@@ -308,7 +320,7 @@ function normalizeDrop(drop) {
     image: drop.image_url || drop.image || null,
     maxSupply: drop.max_supply ?? drop.maxSupply ?? null,
     totalSupply: drop.total_supply ?? drop.totalSupply ?? null,
-    mintedOut: isSoldOut(drop),
+    mintedOut: Boolean(drop.mintedOut) || isSoldOut(drop),
     stages: relevant.length > 0 ? relevant : stages.slice(0, 1),
     source: drop.source || 'opensea',
     contractAddress: drop.contract_address || drop.contractAddress || drop.contracts?.[0]?.address || null,
@@ -601,77 +613,95 @@ async function fetchOpenSeaDrops() {
   return kept;
 }
 
-// ---------- nftcalendar scrape ----------
-async function fetchNftCalendarFallback(existingSlugs = new Set()) {
+// ---------- nftcalendar (Cloudflare blocks direct scrapes; use reader proxy) ----------
+async function fetchNftCalendarMarkdown(url) {
+  const proxied = `https://r.jina.ai/${url}`;
+  const { data } = await axios.get(proxied, {
+    headers: {
+      Accept: 'text/plain',
+      'User-Agent': 'Mozilla/5.0 (compatible; NFTBot/1.0)'
+    },
+    timeout: 20000
+  });
+  return String(data || '');
+}
+
+function parseNftCalendarMarkdown(markdown, chain) {
   const results = [];
+  const chunks = String(markdown || '').split(/\n## \[/);
+
+  for (const chunk of chunks) {
+    const match = chunk.match(
+      /^([^\]]+)\]\((https?:\/\/[^)]+)\)\s*\n+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\s*[–\-—]\s*([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})([\s\S]*)/
+    );
+    if (!match) continue;
+
+    const name = match[1].trim();
+    const url = match[2].trim();
+    const startText = match[3].trim();
+    const endText = match[4].trim();
+    const body = String(match[5] || '');
+    if (!name || name.length < 3) continue;
+    if (!calendarRangeIsRelevant(startText, endText)) continue;
+
+    const imageMatch = chunk.match(/!\[[^\]]*\]\((https?:\/\/[^)]+)\)/);
+    const text = `${name}\n${body}`.toLowerCase();
+    const slugGuess = (url.match(/\/event\/([^/]+)\/?/) || [])[1] ||
+      name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '')
+        .slice(0, 60);
+
+    const startDate = new Date(startText);
+    const startIso = Number.isNaN(startDate.getTime())
+      ? new Date().toISOString()
+      : startDate.toISOString();
+
+    results.push({
+      name,
+      chain,
+      slug: slugGuess,
+      url,
+      image: imageMatch ? imageMatch[1] : null,
+      maxSupply: null,
+      totalSupply: null,
+      mintedOut: text.includes('minted out') || text.includes('sold out'),
+      stages: [
+        {
+          label: 'Calendar window',
+          start_time: startIso,
+          end_time: new Date(endText).toISOString(),
+          price: null
+        }
+      ],
+      source: 'nftcalendar',
+      calendarStart: startText,
+      calendarEnd: endText
+    });
+  }
+
+  return results;
+}
+
+async function fetchNftCalendarFallback(existingSlugs = new Set()) {
   const pages = [
     { url: 'https://nftcalendar.io/b/robinhood/', chain: 'robinhood' },
-    { url: 'https://nftcalendar.io/b/ethereum/', chain: 'ethereum' },
-    { url: 'https://nftcalendar.io/', chain: null }
+    { url: 'https://nftcalendar.io/b/ethereum/', chain: 'ethereum' }
   ];
-  const todayTokens = todayDateTokens();
+  const results = [];
 
   for (const page of pages) {
     try {
-      const { data } = await axios.get(page.url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NFTBot/1.0)' },
-        timeout: 10000
-      });
-      const $ = cheerio.load(data);
+      const markdown = await fetchNftCalendarMarkdown(page.url);
+      const parsed = parseNftCalendarMarkdown(markdown, page.chain);
+      log(`nftcalendar ${page.chain}: ${parsed.length} dated events`);
 
-      $('article, .event, .drop, .event-item, .card').each((_, el) => {
-        const container = $(el);
-        const titleEl = container.find('h2, h3, .event-title, .drop-title').first();
-        const title = (titleEl.text() || container.find('a').first().text() || '').trim();
-        if (!title || title.length < 4) return;
-
-        const text = (container.text() || '').toLowerCase();
-        const link = container.find('a').attr('href') || titleEl.find('a').attr('href') || '';
-
-        let chain = page.chain;
-        if (!chain) {
-          const isRobinhoodPage = text.includes('robinhood') || link.includes('robinhood');
-          const isEth =
-            text.includes('ethereum') ||
-            text.includes(' eth ') ||
-            link.includes('ethereum');
-          if (isRobinhoodPage) chain = 'robinhood';
-          else if (isEth) chain = 'ethereum';
-          else return;
-        }
-
-        const mentionsToday =
-          dateRangeIncludesToday(container.text()) ||
-          todayTokens.some(token => text.includes(token)) ||
-          text.includes('today') ||
-          text.includes('minting now') ||
-          text.includes('minted out') ||
-          text.includes('sold out');
-
-        if (!mentionsToday) return;
-
-        const slugGuess = title
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/^-|-$/g, '')
-          .slice(0, 60);
-
-        if (isOrangeHare({ name: title, slug: slugGuess, url: link }, container.text())) return;
-        if (existingSlugs.has(slugGuess) || results.some(r => r.slug === slugGuess)) return;
-
-        results.push({
-          name: title,
-          chain,
-          slug: slugGuess,
-          url: link.startsWith('http') ? link : `https://nftcalendar.io${link}`,
-          image: container.find('img').attr('src') || container.find('img').attr('data-src') || null,
-          maxSupply: null,
-          totalSupply: null,
-          mintedOut: text.includes('minted out') || text.includes('sold out'),
-          stages: [{ label: 'Check site / Live', start_time: new Date().toISOString(), price: null }],
-          source: 'nftcalendar'
-        });
-      });
+      for (const drop of parsed) {
+        if (isOrangeHare(drop, `${drop.name} ${drop.url}`)) continue;
+        if (existingSlugs.has(drop.slug) || results.some(r => r.slug === drop.slug)) continue;
+        results.push(drop);
+      }
     } catch (err) {
       logError(`nftcalendar scrape failed (${page.url})`, err);
     }
@@ -687,12 +717,16 @@ async function getTodaysMints({ skipPosted = false } = {}) {
   const fallback = await fetchNftCalendarFallback(existing);
   let drops = sortDrops([...openSea, ...fallback].filter(drop => !isOrangeHare(drop)));
   // Keep active mints from the past 24h; drop sold-out older than 8 hours
-  // when we know the age. Robinhood recently_minted with unknown age stays.
+  // when we know the age. Robinhood recently_minted / calendar with unknown age stays.
   drops = drops.filter(drop => {
     if (!(drop.mintedOut || isSoldOut(drop))) return true;
     const age = soldOutAgeHours(drop);
     if (Number.isFinite(age)) return age <= SOLD_OUT_MAX_AGE_HOURS;
-    return isRobinhood(drop) && String(drop.source || '').includes('recently_minted');
+    return (
+      isRobinhood(drop) &&
+      (String(drop.source || '').includes('recently_minted') ||
+        String(drop.source || '').includes('nftcalendar'))
+    );
   });
   const beforeSafety = {
     rh: drops.filter(isRobinhood).length,
