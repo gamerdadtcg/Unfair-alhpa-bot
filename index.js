@@ -11,6 +11,8 @@ const {
 const cron = require('node-cron');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const fs = require('fs');
+const path = require('path');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -44,6 +46,10 @@ const ALLOWED_CHAINS = new Set(['ethereum', 'robinhood']);
 const EMBEDS_PER_MESSAGE = 10;
 const MAX_OPENSEA_PAGES = 8;
 const RECENT_START_HOURS = 48;
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+const POSTED_TTL_MS = 24 * 60 * 60 * 1000;
+const STATE_FILE = path.join(__dirname, 'data', 'state.json');
+const GOPLUS_CHAIN_IDS = { ethereum: '1', robinhood: '4663' };
 const ORANGEHARE_RE = /orange[\s_-]*hare/i;
 const ORANGEHARE_SLUGS = new Set([
   'orangehare-exclusives',
@@ -263,7 +269,10 @@ function normalizeDrop(drop) {
     totalSupply: drop.total_supply ?? drop.totalSupply ?? null,
     mintedOut: isSoldOut(drop),
     stages: relevant.length > 0 ? relevant : stages.slice(0, 1),
-    source: drop.source || 'opensea'
+    source: drop.source || 'opensea',
+    contractAddress: drop.contract_address || drop.contractAddress || drop.contracts?.[0]?.address || null,
+    isDisabled: drop.is_disabled ?? drop.isDisabled ?? false,
+    safelistStatus: drop.safelist_status || drop.safelistStatus || null
   };
 }
 
@@ -294,6 +303,148 @@ async function mapPool(items, concurrency, fn) {
   );
   await Promise.all(workers);
   return results;
+}
+
+// ---------- Remember posted drops ----------
+function defaultState() {
+  return { lastManualDropsAt: 0, posted: {}, safety: {} };
+}
+
+function loadState() {
+  try {
+    return { ...defaultState(), ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) };
+  } catch {
+    return defaultState();
+  }
+}
+
+function saveState(state) {
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state));
+}
+
+function pruneState(state) {
+  const cutoff = Date.now() - POSTED_TTL_MS;
+  for (const [slug, at] of Object.entries(state.posted || {})) {
+    if (at < cutoff) delete state.posted[slug];
+  }
+  for (const [key, entry] of Object.entries(state.safety || {})) {
+    if (!entry?.at || entry.at < cutoff) delete state.safety[key];
+  }
+  return state;
+}
+
+function wasPostedRecently(state, slug) {
+  const at = state.posted?.[slug];
+  return Boolean(at && Date.now() - at < POSTED_TTL_MS);
+}
+
+function markPosted(slugs, { manual = false } = {}) {
+  const state = pruneState(loadState());
+  const now = Date.now();
+  if (manual) state.lastManualDropsAt = now;
+  for (const slug of slugs) {
+    if (slug) state.posted[slug] = now;
+  }
+  saveState(state);
+}
+
+function usedDropsRecently() {
+  const state = loadState();
+  return Date.now() - (state.lastManualDropsAt || 0) < SIX_HOURS_MS;
+}
+
+async function fetchJson(url, options = {}) {
+  try {
+    const res = await axios.get(url, { timeout: 8000, ...options });
+    return res.data;
+  } catch {
+    return null;
+  }
+}
+
+async function isExplorerVerified(chain, address) {
+  if (chain === 'robinhood') {
+    const v2 = await fetchJson(`https://robinhoodchain.blockscout.com/api/v2/smart-contracts/${address}`);
+    if (v2 && (v2.is_verified || v2.is_fully_verified)) return true;
+    const legacy = await fetchJson('https://robinhoodchain.blockscout.com/api', {
+      params: { module: 'contract', action: 'getsourcecode', address }
+    });
+    return Boolean(legacy?.result?.[0]?.SourceCode);
+  }
+
+  const v2 = await fetchJson(`https://eth.blockscout.com/api/v2/smart-contracts/${address}`);
+  if (v2 && (v2.is_verified || v2.is_fully_verified)) return true;
+
+  const params = {
+    chainid: 1,
+    module: 'contract',
+    action: 'getsourcecode',
+    address
+  };
+  if (process.env.ETHERSCAN_API_KEY) params.apikey = process.env.ETHERSCAN_API_KEY;
+  const etherscan = await fetchJson('https://api.etherscan.io/v2/api', { params });
+  return Boolean(etherscan?.result?.[0]?.SourceCode);
+}
+
+async function goplusNftFlags(chain, address) {
+  const chainId = GOPLUS_CHAIN_IDS[chain];
+  if (!chainId) return {};
+  const data = await fetchJson(`https://api.gopluslabs.io/api/v1/nft_security/${chainId}`, {
+    params: { contract_addresses: address }
+  });
+  const result = data?.result;
+  if (!result || typeof result !== 'object') return {};
+  if (result.malicious_nft_contract != null || result.nft_open_source != null) return result;
+  return result[address] || result[address.toLowerCase()] || {};
+}
+
+function looksMalicious(drop, flags = {}) {
+  if (drop.isDisabled || drop.is_disabled) return true;
+  const status = String(drop.safelistStatus || drop.safelist_status || '').toLowerCase();
+  if (status === 'disabled' || status.includes('malware') || status.includes('spam')) return true;
+  const malicious = flags.malicious_nft_contract;
+  return malicious === '1' || malicious === 1 || malicious === true;
+}
+
+function isOpenSourceFlag(flags = {}) {
+  const open = flags.nft_open_source;
+  return open === '1' || open === 1 || open === true;
+}
+
+async function dropIsSafeAndVerified(drop) {
+  if (looksMalicious(drop)) return false;
+
+  const address = drop.contractAddress || drop.contract_address;
+  if (!address) return false;
+
+  const chain = chainOf(drop);
+  const flags = await goplusNftFlags(chain, address);
+  if (looksMalicious(drop, flags)) return false;
+  if (isOpenSourceFlag(flags)) return true;
+  return isExplorerVerified(chain, address);
+}
+
+async function cachedSafety(drop, state) {
+  const address = String(drop.contractAddress || drop.contract_address || '').toLowerCase();
+  const key = `${chainOf(drop)}:${address || drop.slug}`;
+  const hit = state.safety?.[key];
+  if (hit && Date.now() - hit.at < SIX_HOURS_MS) return hit.ok;
+
+  const ok = await dropIsSafeAndVerified(drop);
+  state.safety = state.safety || {};
+  state.safety[key] = { ok, at: Date.now() };
+  return ok;
+}
+
+async function filterSafeVerified(drops) {
+  const state = pruneState(loadState());
+  const checked = await mapPool(drops, 4, async drop => ({
+    drop,
+    ok: await cachedSafety(drop, state)
+  }));
+  saveState(state);
+  return checked.filter(item => item.ok).map(item => item.drop);
 }
 
 // ---------- OpenSea ----------
@@ -349,7 +500,11 @@ async function enrichOpenSeaDrop(drop) {
     twitter_username: collection.twitter_username,
     discord_url: collection.discord_url,
     owner: collection.owner,
-    created_date: collection.created_date
+    created_date: collection.created_date,
+    is_disabled: collection.is_disabled,
+    safelist_status: collection.safelist_status,
+    contracts: collection.contracts,
+    contract_address: drop.contract_address || detail.contract_address || collection.contracts?.[0]?.address
   };
 }
 
@@ -468,11 +623,17 @@ async function fetchNftCalendarFallback(existingSlugs = new Set()) {
 }
 
 // ---------- Combine ----------
-async function getTodaysMints() {
+async function getTodaysMints({ skipPosted = false } = {}) {
   const openSea = await fetchOpenSeaDrops();
   const existing = new Set(openSea.map(d => d.slug));
   const fallback = await fetchNftCalendarFallback(existing);
-  return sortDrops([...openSea, ...fallback].filter(drop => !isOrangeHare(drop)));
+  let drops = sortDrops([...openSea, ...fallback].filter(drop => !isOrangeHare(drop)));
+  drops = await filterSafeVerified(drops);
+  if (skipPosted) {
+    const state = loadState();
+    drops = drops.filter(drop => !wasPostedRecently(state, drop.slug));
+  }
+  return drops;
 }
 
 // ---------- Embeds: one compact list with small thumbnails ----------
@@ -571,13 +732,14 @@ async function sendPayloads(channel, payloads, isSlash) {
 }
 
 // ---------- Post ----------
-async function postDrops(channel, isSlash = false) {
-  const drops = await getTodaysMints();
+async function postDrops(channel, { isSlash = false, skipPosted = false } = {}) {
+  const drops = await getTodaysMints({ skipPosted });
 
   if (drops.length === 0) {
-    const msg = 'No active ETH or Robinhood Chain mints found right now.';
+    const msg = 'No verified ETH or Robinhood mints to show right now.';
     if (isSlash) return channel.editReply({ content: msg });
-    return channel.send(msg);
+    log('Scheduled post skipped: nothing new after filters.');
+    return;
   }
 
   const listEmbeds = buildListEmbeds(drops);
@@ -598,13 +760,14 @@ async function postDrops(channel, isSlash = false) {
   }
 
   await sendPayloads(channel, payloads, isSlash);
+  markPosted(drops.map(drop => drop.slug), { manual: isSlash });
 }
 
 // ---------- Slash Command ----------
 const commands = [
   new SlashCommandBuilder()
     .setName('drops')
-    .setDescription("Show today's ETH + Robinhood NFT mints")
+    .setDescription("Show today's verified ETH + Robinhood NFT mints")
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -630,7 +793,7 @@ client.on('interactionCreate', async interaction => {
 
   try {
     await interaction.deferReply();
-    await postDrops(interaction, true);
+    await postDrops(interaction, { isSlash: true });
   } catch (err) {
     logError('/drops failed', err);
     try {
@@ -647,14 +810,18 @@ client.on('interactionCreate', async interaction => {
 });
 
 cron.schedule(
-  '0 0 * * *',
+  '0 */6 * * *',
   async () => {
-    log('Running daily mint alert...');
+    if (usedDropsRecently()) {
+      log('Skipping scheduled post; /drops was used in the last 6 hours.');
+      return;
+    }
+    log('Running 6-hour mint alert...');
     try {
       const channel = await client.channels.fetch(process.env.CHANNEL_ID);
-      await postDrops(channel, false);
+      await postDrops(channel, { skipPosted: true });
     } catch (err) {
-      logError('Daily post failed', err);
+      logError('Scheduled post failed', err);
     }
   },
   { timezone: 'America/Los_Angeles' }
