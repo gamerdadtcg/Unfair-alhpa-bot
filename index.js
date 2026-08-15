@@ -46,6 +46,7 @@ const ALLOWED_CHAINS = new Set(['ethereum', 'robinhood']);
 const EMBEDS_PER_MESSAGE = 10;
 const MAX_OPENSEA_PAGES = 8;
 const RECENT_START_HOURS = 48;
+const MINTED_OUT_MAX_AGE_HOURS = 8;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 const POSTED_TTL_MS = 24 * 60 * 60 * 1000;
 const STATE_FILE = path.join(__dirname, 'data', 'state.json');
@@ -154,6 +155,37 @@ function isSoldOut(drop) {
   return max > 0 && total >= max;
 }
 
+function hoursSince(isoString) {
+  if (!isoString) return Infinity;
+  const t = new Date(isoString).getTime();
+  if (Number.isNaN(t)) return Infinity;
+  return (Date.now() - t) / 36e5;
+}
+
+// Minted-out drops only stay on the list for a short window.
+function wasMintedOutRecently(drop, hours = MINTED_OUT_MAX_AGE_HOURS) {
+  const stages = allStages(drop);
+  let bestAge = Infinity;
+
+  for (const stage of stages) {
+    if (stage?.end_time) {
+      const age = hoursSince(stage.end_time);
+      if (age >= 0) bestAge = Math.min(bestAge, age);
+    }
+    if (stage?.start_time) {
+      const age = hoursSince(stage.start_time);
+      if (age >= 0) bestAge = Math.min(bestAge, age);
+    }
+  }
+
+  if (drop.created_date) {
+    const age = hoursSince(drop.created_date);
+    if (age >= 0) bestAge = Math.min(bestAge, age);
+  }
+
+  return Number.isFinite(bestAge) && bestAge <= hours;
+}
+
 function stageWindowOverlapsToday(stage) {
   if (!stage?.start_time) return false;
 
@@ -181,6 +213,10 @@ function stageIsRelevant(stage) {
 }
 
 function dropBelongsOnTodaysList(drop) {
+  const soldOut = isSoldOut(drop);
+  // Hide minted-out projects once they are older than MINTED_OUT_MAX_AGE_HOURS.
+  if (soldOut && !wasMintedOutRecently(drop)) return false;
+
   if (drop.is_minting === true) return true;
   if (isToday(drop.created_date) || isWithinHours(drop.created_date, RECENT_START_HOURS)) {
     return true;
@@ -188,7 +224,6 @@ function dropBelongsOnTodaysList(drop) {
 
   const stages = allStages(drop);
   const recentlyMinted = String(drop.source || '').includes('recently_minted');
-  const soldOut = isSoldOut(drop);
 
   if (recentlyMinted) return true;
   if (stages.some(s => isToday(s.start_time) || isToday(s.end_time) || isWithinHours(s.start_time, RECENT_START_HOURS))) {
@@ -628,6 +663,8 @@ async function getTodaysMints({ skipPosted = false } = {}) {
   const existing = new Set(openSea.map(d => d.slug));
   const fallback = await fetchNftCalendarFallback(existing);
   let drops = sortDrops([...openSea, ...fallback].filter(drop => !isOrangeHare(drop)));
+  // Also apply the minted-out age cutoff to nftcalendar / normalized drops.
+  drops = drops.filter(drop => !drop.mintedOut || wasMintedOutRecently(drop));
   drops = await filterSafeVerified(drops);
   if (skipPosted) {
     const state = loadState();
