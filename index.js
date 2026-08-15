@@ -21,6 +21,18 @@ const OPENSEA_HEADERS = {
 const ALLOWED_CHAINS = new Set(['ethereum', 'robinhood']);
 const EMBEDS_PER_MESSAGE = 10;
 const MAX_OPENSEA_PAGES = 5;
+const ORANGEHARE_RE = /orange[\s_-]*hare/i;
+const ORANGEHARE_SLUGS = new Set([
+  'orangehare-exclusives',
+  'orangehare-korean-pop-revolution-1',
+  'seoul-city-korean-artists-orangehare',
+  'cheap-shot',
+  'beast-battle',
+  'bone-theater',
+  'sacred-mythos',
+  'steel-garden',
+  'knuckle-up'
+]);
 
 // ---------- Helpers ----------
 function pacificNow() {
@@ -52,6 +64,37 @@ function isRobinhood(drop) {
 
 function chainLabel(drop) {
   return isRobinhood(drop) ? 'Robinhood' : 'Ethereum';
+}
+
+function isOrangeHare(drop, extraText = '') {
+  const slug = String(drop.slug || drop.collection_slug || '').toLowerCase();
+  if (ORANGEHARE_SLUGS.has(slug)) return true;
+
+  const haystack = [
+    drop.name,
+    drop.collection_name,
+    slug,
+    drop.url,
+    drop.opensea_url,
+    drop.image,
+    drop.image_url,
+    drop.description,
+    drop.project_url,
+    drop.twitter_username,
+    drop.discord_url,
+    drop.owner,
+    extraText
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return (
+    ORANGEHARE_RE.test(haystack) ||
+    haystack.includes('orangehare.io') ||
+    haystack.includes('orangehare_network') ||
+    haystack.includes('orangehare_io')
+  );
 }
 
 function isSoldOut(drop) {
@@ -229,15 +272,30 @@ async function fetchOpenSeaPages(type, chains) {
 }
 
 async function enrichOpenSeaDrop(drop) {
-  try {
-    const detail = await axios.get(
-      `https://api.opensea.io/api/v2/drops/${drop.collection_slug}`,
-      { headers: OPENSEA_HEADERS, timeout: 10000 }
-    );
-    return { ...drop, ...detail.data, source: drop.source };
-  } catch (err) {
-    return drop;
-  }
+  const [detailRes, collectionRes] = await Promise.allSettled([
+    axios.get(`https://api.opensea.io/api/v2/drops/${drop.collection_slug}`, {
+      headers: OPENSEA_HEADERS,
+      timeout: 10000
+    }),
+    axios.get(`https://api.opensea.io/api/v2/collections/${drop.collection_slug}`, {
+      headers: OPENSEA_HEADERS,
+      timeout: 10000
+    })
+  ]);
+
+  const detail = detailRes.status === 'fulfilled' ? detailRes.value.data : {};
+  const collection = collectionRes.status === 'fulfilled' ? collectionRes.value.data : {};
+
+  return {
+    ...drop,
+    ...detail,
+    source: drop.source,
+    description: collection.description,
+    project_url: collection.project_url,
+    twitter_username: collection.twitter_username,
+    discord_url: collection.discord_url,
+    owner: collection.owner
+  };
 }
 
 async function fetchOpenSeaDrops() {
@@ -252,6 +310,7 @@ async function fetchOpenSeaDrops() {
         const slug = drop.collection_slug;
         if (!slug || resultsMap.has(slug)) continue;
         if (!isAllowedChain(drop.chain)) continue;
+        if (isOrangeHare(drop)) continue;
         resultsMap.set(slug, { ...drop, source: `opensea-${type}` });
       }
     }
@@ -262,6 +321,7 @@ async function fetchOpenSeaDrops() {
 
   for (const drop of enriched) {
     if (!isAllowedChain(drop.chain)) continue;
+    if (isOrangeHare(drop)) continue;
     if (!dropIsMintingToday(drop)) continue;
     if (isSoldOut(drop)) continue;
     kept.push(normalizeDrop(drop));
@@ -323,6 +383,7 @@ async function fetchNftCalendarFallback(existingSlugs = new Set()) {
           .replace(/^-|-$/g, '')
           .slice(0, 60);
 
+        if (isOrangeHare({ name: title, slug: slugGuess, url: link }, container.text())) return;
         if (existingSlugs.has(slugGuess) || results.some(r => r.slug === slugGuess)) return;
 
         results.push({
@@ -350,7 +411,7 @@ async function getTodaysMints() {
   const openSea = await fetchOpenSeaDrops();
   const existing = new Set(openSea.map(d => d.slug));
   const fallback = await fetchNftCalendarFallback(existing);
-  return sortDrops([...openSea, ...fallback]);
+  return sortDrops([...openSea, ...fallback].filter(drop => !isOrangeHare(drop)));
 }
 
 // ---------- Embeds: one compact list with small thumbnails ----------
