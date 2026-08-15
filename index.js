@@ -724,9 +724,6 @@ function buildListEmbeds(drops) {
   });
 }
 
-  });
-}
-
 function chunk(items, size) {
   const batches = [];
   for (let i = 0; i < items.length; i += size) {
