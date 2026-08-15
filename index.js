@@ -179,64 +179,35 @@ function soldOutWithinHours(drop, hours = SOLD_OUT_MAX_AGE_HOURS) {
   return Number.isFinite(age) && age <= hours;
 }
 
-function stageWindowOverlapsLookback(stage, hours = MINT_LOOKBACK_HOURS) {
-  if (!stage?.start_time) return false;
+// Available supply = last 24h. Minted out = last 8h.
+function dropFitsTimeWindow(drop) {
+  const soldOut = Boolean(drop.mintedOut) || isSoldOut(drop);
+  const limitHours = soldOut ? SOLD_OUT_MAX_AGE_HOURS : MINT_LOOKBACK_HOURS;
+  const age = soldOutAgeHours(drop);
 
-  const start = new Date(stage.start_time).getTime();
-  if (Number.isNaN(start)) return false;
-  const end = stage.end_time ? new Date(stage.end_time).getTime() : Infinity;
-  const lookbackStart = Date.now() - hours * 36e5;
+  if (!Number.isFinite(age)) {
+    // No usable timestamp: only keep live, still-available mints.
+    return !soldOut && drop.is_minting === true;
+  }
 
-  return start <= Date.now() && end >= lookbackStart;
+  // Ignore starts more than ~1 hour in the future.
+  if (age < -1) return false;
+  return age <= limitHours;
 }
 
 function stageIsRelevant(stage) {
   if (!stage) return false;
   return (
-    isToday(stage.start_time) ||
-    isToday(stage.end_time) ||
     isWithinHours(stage.start_time, MINT_LOOKBACK_HOURS) ||
-    isWithinHours(stage.end_time, MINT_LOOKBACK_HOURS) ||
-    stageWindowOverlapsLookback(stage)
+    isWithinHours(stage.end_time, SOLD_OUT_MAX_AGE_HOURS)
   );
 }
 
 function dropBelongsOnTodaysList(drop) {
-  const soldOut = isSoldOut(drop) || drop.mintedOut === true;
-  const recentlyMinted = String(drop.source || '').includes('recently_minted');
-  const robinhood = chainOf(drop).includes('robinhood');
-  const age = soldOutAgeHours(drop);
-
-  // Sold-out projects only stay visible for SOLD_OUT_MAX_AGE_HOURS.
-  // Robinhood recently-minted often lacks reliable stage timestamps — only
-  // hide those when we can prove they are older than the cutoff.
-  if (soldOut) {
-    if (Number.isFinite(age) && age > SOLD_OUT_MAX_AGE_HOURS) return false;
-    if (!Number.isFinite(age) && !(robinhood && recentlyMinted)) return false;
-  }
-
-  if (drop.is_minting === true) return true;
-  // Robinhood volume is thinner on OpenSea; keep recently_minted RH visible.
-  if (robinhood && recentlyMinted) return true;
-  if (isToday(drop.created_date) || isWithinHours(drop.created_date, MINT_LOOKBACK_HOURS)) {
-    return true;
-  }
-
-  const stages = allStages(drop);
-  if (
-    stages.some(
-      s =>
-        isToday(s.start_time) ||
-        isToday(s.end_time) ||
-        isWithinHours(s.start_time, MINT_LOOKBACK_HOURS) ||
-        isWithinHours(s.end_time, MINT_LOOKBACK_HOURS)
-    )
-  ) {
-    return true;
-  }
-  if (!soldOut && stages.some(s => stageWindowOverlapsLookback(s))) return true;
-
-  return false;
+  return dropFitsTimeWindow({
+    ...drop,
+    mintedOut: Boolean(drop.mintedOut) || isSoldOut(drop)
+  });
 }
 
 function formatPrice(stage) {
@@ -305,17 +276,15 @@ function formatStart(stage) {
   });
 }
 
-function calendarRangeIsRelevant(startText, endText) {
+function calendarRangeIsRelevant(startText, endText, { mintedOut = false } = {}) {
   const start = new Date(startText);
-  const end = new Date(endText);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return false;
+  if (Number.isNaN(start.getTime())) return false;
 
-  start.setHours(0, 0, 0, 0);
-  end.setHours(23, 59, 59, 999);
-  const now = Date.now();
-  const from = now - MINT_LOOKBACK_HOURS * 36e5;
-  const until = now + MINT_LOOKBACK_HOURS * 36e5;
-  return start.getTime() <= until && end.getTime() >= from;
+  const ageHours = (Date.now() - start.getTime()) / 36e5;
+  if (ageHours < -1) return false;
+
+  const limitHours = mintedOut ? SOLD_OUT_MAX_AGE_HOURS : MINT_LOOKBACK_HOURS;
+  return ageHours <= limitHours;
 }
 
 function normalizeDrop(drop) {
@@ -655,10 +624,12 @@ function parseNftCalendarMarkdown(markdown, chain) {
     const endText = match[4].trim();
     const body = String(match[5] || '');
     if (!name || name.length < 3) continue;
-    if (!calendarRangeIsRelevant(startText, endText)) continue;
+
+    const text = `${name}\n${body}`.toLowerCase();
+    const mintedOut = text.includes('minted out') || text.includes('sold out');
+    if (!calendarRangeIsRelevant(startText, endText, { mintedOut })) continue;
 
     const imageMatch = chunk.match(/!\[[^\]]*\]\((https?:\/\/[^)]+)\)/);
-    const text = `${name}\n${body}`.toLowerCase();
     const slugGuess = (url.match(/\/event\/([^/]+)\/?/) || [])[1] ||
       name
         .toLowerCase()
@@ -679,7 +650,7 @@ function parseNftCalendarMarkdown(markdown, chain) {
       image: imageMatch ? imageMatch[1] : null,
       maxSupply: null,
       totalSupply: null,
-      mintedOut: text.includes('minted out') || text.includes('sold out'),
+      mintedOut,
       stages: [
         {
           label: 'Calendar window',
@@ -729,18 +700,8 @@ async function getTodaysMints({ skipPosted = false } = {}) {
   const existing = new Set(openSea.map(d => d.slug));
   const fallback = await fetchNftCalendarFallback(existing);
   let drops = sortDrops([...openSea, ...fallback].filter(drop => !isOrangeHare(drop)));
-  // Keep active mints from the past 24h; drop sold-out older than 8 hours
-  // when we know the age. Robinhood recently_minted / calendar with unknown age stays.
-  drops = drops.filter(drop => {
-    if (!(drop.mintedOut || isSoldOut(drop))) return true;
-    const age = soldOutAgeHours(drop);
-    if (Number.isFinite(age)) return age <= SOLD_OUT_MAX_AGE_HOURS;
-    return (
-      isRobinhood(drop) &&
-      (String(drop.source || '').includes('recently_minted') ||
-        String(drop.source || '').includes('nftcalendar'))
-    );
-  });
+  // Available supply: last 24 hours. Minted out: last 8 hours.
+  drops = drops.filter(dropFitsTimeWindow);
   const beforeSafety = {
     rh: drops.filter(isRobinhood).length,
     eth: drops.filter(d => !isRobinhood(d)).length
@@ -800,6 +761,12 @@ function buildListEmbeds(drops) {
   }
   if (current.length) descriptions.push(current.join('\n\n'));
 
+  const dyor =
+    '\n\n*DYOR — Robinhood projects are not contract-verified. Always do your own research.*';
+  if (descriptions.length) {
+    descriptions[descriptions.length - 1] += dyor;
+  }
+
   return descriptions.map((description, index) => {
     const embed = new EmbedBuilder()
       .setColor(0x111111)
@@ -809,9 +776,11 @@ function buildListEmbeds(drops) {
       embed
         .setTitle(`Today's NFT Mints · ${today}`)
         .setFooter({
-          text: `${drops.length} projects · 🟢 Robinhood ${rhCount} · 🟣 Ethereum ${ethCount} · ${mintedOutCount} minted out`
+          text: `${drops.length} projects · 🟢 Robinhood ${rhCount} · 🟣 Ethereum ${ethCount} · ${mintedOutCount} minted out · DYOR`
         })
         .setTimestamp();
+    } else if (index === descriptions.length - 1) {
+      embed.setTitle("Today's NFT Mints · continued");
     } else {
       embed.setTitle("Today's NFT Mints · continued");
     }
