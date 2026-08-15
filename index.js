@@ -452,13 +452,19 @@ async function dropIsSafeAndVerified(drop) {
   const chain = chainOf(drop);
   const flags = await goplusNftFlags(chain, address);
   if (looksMalicious(drop, flags)) return false;
+
+  // Robinhood explorer/GoPlus coverage is spotty for brand-new mints.
+  // Keep spam/malware blocked, but don't require source verification there.
+  if (chain.includes('robinhood')) return true;
+
   if (isOpenSourceFlag(flags)) return true;
   return isExplorerVerified(chain, address);
 }
 
 async function cachedSafety(drop, state) {
   const address = String(drop.contractAddress || drop.contract_address || '').toLowerCase();
-  const key = `${chainOf(drop)}:${address || drop.slug}`;
+  // Bump key version so older negative cache entries do not keep hiding Robinhood.
+  const key = `v2:${chainOf(drop)}:${address || drop.slug}`;
   const hit = state.safety?.[key];
   if (hit && Date.now() - hit.at < SIX_HOURS_MS) return hit.ok;
 
@@ -525,6 +531,8 @@ async function enrichOpenSeaDrop(drop) {
   return {
     ...drop,
     ...detail,
+    // Preserve the chain from the list response; detail payloads can null it out.
+    chain: drop.chain || detail.chain,
     source: drop.source,
     description: collection.description,
     project_url: collection.project_url,
@@ -535,12 +543,14 @@ async function enrichOpenSeaDrop(drop) {
     is_disabled: collection.is_disabled,
     safelist_status: collection.safelist_status,
     contracts: collection.contracts,
-    contract_address: drop.contract_address || detail.contract_address || collection.contracts?.[0]?.address
+    contract_address:
+      drop.contract_address || detail.contract_address || collection.contracts?.[0]?.address
   };
 }
 
 async function fetchOpenSeaDrops() {
-  const chainAttempts = ['ethereum,robinhood'];
+  // Fetch each chain on its own so Ethereum results do not crowd out Robinhood.
+  const chainAttempts = ['robinhood', 'ethereum'];
   const typeAttempts = [
     { type: 'recently_minted', pages: MAX_OPENSEA_PAGES },
     { type: 'featured', pages: MAX_OPENSEA_PAGES },
@@ -551,6 +561,7 @@ async function fetchOpenSeaDrops() {
   for (const chains of chainAttempts) {
     for (const { type, pages } of typeAttempts) {
       const drops = await fetchOpenSeaPages(type, chains, pages);
+      log(`OpenSea ${type} ${chains}: ${drops.length} raw drops`);
       for (const drop of drops) {
         const slug = drop.collection_slug;
         if (!slug || resultsMap.has(slug)) continue;
@@ -563,14 +574,20 @@ async function fetchOpenSeaDrops() {
 
   const enriched = await mapPool([...resultsMap.values()], 5, enrichOpenSeaDrop);
   const kept = [];
+  let rhRaw = 0;
+  let ethRaw = 0;
 
   for (const drop of enriched) {
     if (!isAllowedChain(drop.chain)) continue;
     if (isOrangeHare(drop)) continue;
     if (!dropBelongsOnTodaysList(drop)) continue;
-    kept.push(normalizeDrop(drop));
+    const normalized = normalizeDrop(drop);
+    if (isRobinhood(normalized)) rhRaw += 1;
+    else ethRaw += 1;
+    kept.push(normalized);
   }
 
+  log(`OpenSea kept after time filters: 🟢 ${rhRaw} Robinhood · 🟣 ${ethRaw} Ethereum`);
   return kept;
 }
 
@@ -664,7 +681,14 @@ async function getTodaysMints({ skipPosted = false } = {}) {
     if (!(drop.mintedOut || isSoldOut(drop))) return true;
     return soldOutWithinHours(drop);
   });
+  const beforeSafety = {
+    rh: drops.filter(isRobinhood).length,
+    eth: drops.filter(d => !isRobinhood(d)).length
+  };
   drops = await filterSafeVerified(drops);
+  log(
+    `Safety filter: 🟢 ${beforeSafety.rh}→${drops.filter(isRobinhood).length} Robinhood · 🟣 ${beforeSafety.eth}→${drops.filter(d => !isRobinhood(d)).length} Ethereum`
+  );
   if (skipPosted) {
     const state = loadState();
     drops = drops.filter(drop => !wasPostedRecently(state, drop.slug));
