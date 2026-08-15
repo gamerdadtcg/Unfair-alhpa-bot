@@ -204,11 +204,21 @@ function stageIsRelevant(stage) {
 
 function dropBelongsOnTodaysList(drop) {
   const soldOut = isSoldOut(drop) || drop.mintedOut === true;
+  const recentlyMinted = String(drop.source || '').includes('recently_minted');
+  const robinhood = chainOf(drop).includes('robinhood');
+  const age = soldOutAgeHours(drop);
 
   // Sold-out projects only stay visible for SOLD_OUT_MAX_AGE_HOURS.
-  if (soldOut && !soldOutWithinHours(drop)) return false;
+  // Robinhood recently-minted often lacks reliable stage timestamps — only
+  // hide those when we can prove they are older than the cutoff.
+  if (soldOut) {
+    if (Number.isFinite(age) && age > SOLD_OUT_MAX_AGE_HOURS) return false;
+    if (!Number.isFinite(age) && !(robinhood && recentlyMinted)) return false;
+  }
 
   if (drop.is_minting === true) return true;
+  // Robinhood volume is thinner on OpenSea; keep recently_minted RH visible.
+  if (robinhood && recentlyMinted) return true;
   if (isToday(drop.created_date) || isWithinHours(drop.created_date, MINT_LOOKBACK_HOURS)) {
     return true;
   }
@@ -444,6 +454,12 @@ function isOpenSourceFlag(flags = {}) {
 }
 
 async function dropIsSafeAndVerified(drop) {
+  // Robinhood: only block explicitly disabled collections. GoPlus/explorer
+  // checks hide too many real RH mints compared with Ethereum.
+  if (isRobinhood(drop)) {
+    return !(drop.isDisabled || drop.is_disabled);
+  }
+
   if (looksMalicious(drop)) return false;
 
   const address = drop.contractAddress || drop.contract_address;
@@ -452,19 +468,14 @@ async function dropIsSafeAndVerified(drop) {
   const chain = chainOf(drop);
   const flags = await goplusNftFlags(chain, address);
   if (looksMalicious(drop, flags)) return false;
-
-  // Robinhood explorer/GoPlus coverage is spotty for brand-new mints.
-  // Keep spam/malware blocked, but don't require source verification there.
-  if (chain.includes('robinhood')) return true;
-
   if (isOpenSourceFlag(flags)) return true;
   return isExplorerVerified(chain, address);
 }
 
 async function cachedSafety(drop, state) {
   const address = String(drop.contractAddress || drop.contract_address || '').toLowerCase();
-  // Bump key version so older negative cache entries do not keep hiding Robinhood.
-  const key = `v2:${chainOf(drop)}:${address || drop.slug}`;
+  // Bump key version whenever Robinhood safety rules change.
+  const key = `v3:${chainOf(drop)}:${address || drop.slug}`;
   const hit = state.safety?.[key];
   if (hit && Date.now() - hit.at < SIX_HOURS_MS) return hit.ok;
 
@@ -550,16 +561,15 @@ async function enrichOpenSeaDrop(drop) {
 
 async function fetchOpenSeaDrops() {
   // Fetch each chain on its own so Ethereum results do not crowd out Robinhood.
-  const chainAttempts = ['robinhood', 'ethereum'];
-  const typeAttempts = [
-    { type: 'recently_minted', pages: MAX_OPENSEA_PAGES },
-    { type: 'featured', pages: MAX_OPENSEA_PAGES },
-    { type: 'upcoming', pages: MAX_OPENSEA_PAGES }
+  const chainAttempts = [
+    { chains: 'robinhood', pages: MAX_OPENSEA_PAGES },
+    { chains: 'ethereum', pages: MAX_OPENSEA_PAGES }
   ];
+  const typeAttempts = ['recently_minted', 'featured', 'upcoming'];
   const resultsMap = new Map();
 
-  for (const chains of chainAttempts) {
-    for (const { type, pages } of typeAttempts) {
+  for (const { chains, pages } of chainAttempts) {
+    for (const type of typeAttempts) {
       const drops = await fetchOpenSeaPages(type, chains, pages);
       log(`OpenSea ${type} ${chains}: ${drops.length} raw drops`);
       for (const drop of drops) {
@@ -676,10 +686,13 @@ async function getTodaysMints({ skipPosted = false } = {}) {
   const existing = new Set(openSea.map(d => d.slug));
   const fallback = await fetchNftCalendarFallback(existing);
   let drops = sortDrops([...openSea, ...fallback].filter(drop => !isOrangeHare(drop)));
-  // Keep active mints from the past 24h; drop sold-out older than 8 hours.
+  // Keep active mints from the past 24h; drop sold-out older than 8 hours
+  // when we know the age. Robinhood recently_minted with unknown age stays.
   drops = drops.filter(drop => {
     if (!(drop.mintedOut || isSoldOut(drop))) return true;
-    return soldOutWithinHours(drop);
+    const age = soldOutAgeHours(drop);
+    if (Number.isFinite(age)) return age <= SOLD_OUT_MAX_AGE_HOURS;
+    return isRobinhood(drop) && String(drop.source || '').includes('recently_minted');
   });
   const beforeSafety = {
     rh: drops.filter(isRobinhood).length,
