@@ -26,17 +26,6 @@ function logError(label, err) {
   log(`${label}${status ? ` (${status})` : ''}: ${msg}`);
 }
 
-function safeImageUrl(url) {
-  if (!url || typeof url !== 'string') return null;
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-    return parsed.href;
-  } catch {
-    return null;
-  }
-}
-
 const OPENSEA_HEADERS = {
   Accept: 'application/json',
   'X-API-KEY': process.env.OPENSEA_API_KEY || ''
@@ -46,7 +35,7 @@ const ALLOWED_CHAINS = new Set(['ethereum', 'robinhood']);
 const EMBEDS_PER_MESSAGE = 10;
 const MAX_OPENSEA_PAGES = 8;
 const MINT_LOOKBACK_HOURS = 24;
-const SOLD_OUT_EXCLUDE_HOURS = 8;
+const SOLD_OUT_MAX_AGE_HOURS = 8;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 const POSTED_TTL_MS = 24 * 60 * 60 * 1000;
 const STATE_FILE = path.join(__dirname, 'data', 'state.json');
@@ -186,7 +175,7 @@ function soldOutAgeHours(drop) {
   return bestAge;
 }
 
-function soldOutWithinHours(drop, hours = SOLD_OUT_EXCLUDE_HOURS) {
+function soldOutWithinHours(drop, hours = SOLD_OUT_MAX_AGE_HOURS) {
   const age = soldOutAgeHours(drop);
   return Number.isFinite(age) && age <= hours;
 }
@@ -215,8 +204,9 @@ function stageIsRelevant(stage) {
 
 function dropBelongsOnTodaysList(drop) {
   const soldOut = isSoldOut(drop) || drop.mintedOut === true;
-  // Hide anything that sold out within the past 8 hours.
-  if (soldOut && soldOutWithinHours(drop)) return false;
+
+  // Sold-out projects only stay visible for SOLD_OUT_MAX_AGE_HOURS.
+  if (soldOut && !soldOutWithinHours(drop)) return false;
 
   if (drop.is_minting === true) return true;
   if (isToday(drop.created_date) || isWithinHours(drop.created_date, MINT_LOOKBACK_HOURS)) {
@@ -669,8 +659,11 @@ async function getTodaysMints({ skipPosted = false } = {}) {
   const existing = new Set(openSea.map(d => d.slug));
   const fallback = await fetchNftCalendarFallback(existing);
   let drops = sortDrops([...openSea, ...fallback].filter(drop => !isOrangeHare(drop)));
-  // Exclude anything that sold out within the past 8 hours.
-  drops = drops.filter(drop => !(drop.mintedOut && soldOutWithinHours(drop)));
+  // Keep active mints from the past 24h; drop sold-out older than 8 hours.
+  drops = drops.filter(drop => {
+    if (!(drop.mintedOut || isSoldOut(drop))) return true;
+    return soldOutWithinHours(drop);
+  });
   drops = await filterSafeVerified(drops);
   if (skipPosted) {
     const state = loadState();
@@ -731,20 +724,7 @@ function buildListEmbeds(drops) {
   });
 }
 
-function buildThumbEmbed(drop) {
-  const stage = (drop.stages || [])[0];
-  const embed = new EmbedBuilder()
-    .setTitle(drop.name)
-    .setURL(drop.url)
-    .setColor(drop.mintedOut ? 0x888888 : isRobinhood(drop) ? 0x00c805 : 0x627eea)
-    .setDescription(
-      `**${chainLabel(drop)}** · ${formatSupply(drop)} · ${formatPrice(stage)}\n${stage?.label || stage?.stage_type || 'Mint'} · ${formatStart(stage)} PST`
-    )
-    .setFooter({ text: `Source: ${drop.source}` });
-
-  const image = safeImageUrl(drop.image);
-  if (image) embed.setThumbnail(image);
-  return embed;
+  });
 }
 
 function chunk(items, size) {
@@ -786,7 +766,6 @@ async function postDrops(channel, { isSlash = false, skipPosted = false } = {}) 
   }
 
   const listEmbeds = buildListEmbeds(drops);
-  const thumbEmbeds = drops.map(buildThumbEmbed);
   const payloads = [];
 
   payloads.push({
@@ -795,10 +774,6 @@ async function postDrops(channel, { isSlash = false, skipPosted = false } = {}) 
   });
 
   for (const batch of chunk(listEmbeds.slice(EMBEDS_PER_MESSAGE), EMBEDS_PER_MESSAGE)) {
-    payloads.push({ embeds: batch });
-  }
-
-  for (const batch of chunk(thumbEmbeds, EMBEDS_PER_MESSAGE)) {
     payloads.push({ embeds: batch });
   }
 
