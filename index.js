@@ -20,7 +20,8 @@ const OPENSEA_HEADERS = {
 
 const ALLOWED_CHAINS = new Set(['ethereum', 'robinhood']);
 const EMBEDS_PER_MESSAGE = 10;
-const MAX_OPENSEA_PAGES = 5;
+const MAX_OPENSEA_PAGES = 8;
+const RECENT_START_HOURS = 48;
 const ORANGEHARE_RE = /orange[\s_-]*hare/i;
 const ORANGEHARE_SLUGS = new Set([
   'orangehare-exclusives',
@@ -39,15 +40,37 @@ function pacificNow() {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
 }
 
+function zonedYmd(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric'
+  }).formatToParts(date);
+  const get = type => Number(parts.find(p => p.type === type)?.value);
+  return { y: get('year'), m: get('month'), d: get('day') };
+}
+
 function isToday(isoString) {
   if (!isoString) return false;
-  const d = new Date(isoString);
-  const today = pacificNow();
-  return (
-    d.getFullYear() === today.getFullYear() &&
-    d.getMonth() === today.getMonth() &&
-    d.getDate() === today.getDate()
-  );
+  const date = isoString instanceof Date ? isoString : new Date(isoString);
+  if (Number.isNaN(date.getTime())) return false;
+  const a = zonedYmd(date);
+  const b = zonedYmd();
+  return a.y === b.y && a.m === b.m && a.d === b.d;
+}
+
+function isWithinHours(isoString, hours) {
+  if (!isoString) return false;
+  const t = new Date(isoString).getTime();
+  if (Number.isNaN(t)) return false;
+  const delta = Date.now() - t;
+  return delta >= -hours * 36e5 && delta <= hours * 36e5;
+}
+
+function allStages(drop) {
+  return [drop.active_stage, drop.next_stage, ...(drop.stages || [])].filter(Boolean);
 }
 
 function chainOf(drop) {
@@ -100,47 +123,50 @@ function isOrangeHare(drop, extraText = '') {
 function isSoldOut(drop) {
   const max = Number(drop.max_supply || drop.maxSupply || 0);
   const total = Number(drop.total_supply || drop.totalSupply || 0);
-  if (max > 0 && total >= max) return true;
+  return max > 0 && total >= max;
+}
 
-  const stages = drop.stages || [];
-  if (stages.length === 0) return false;
+function stageWindowOverlapsToday(stage) {
+  if (!stage?.start_time) return false;
 
-  const hasActiveStage = stages.some(s => {
-    const now = Date.now();
-    const start = s.start_time ? new Date(s.start_time).getTime() : 0;
-    const end = s.end_time ? new Date(s.end_time).getTime() : Infinity;
-    return now >= start && now <= end;
-  });
+  const today = pacificNow();
+  const startOfDay = new Date(today);
+  startOfDay.setHours(0, 0, 0, 0);
+  const endOfDay = new Date(today);
+  endOfDay.setHours(23, 59, 59, 999);
 
-  return !hasActiveStage && total > 0;
+  const start = new Date(stage.start_time).getTime();
+  const end = stage.end_time ? new Date(stage.end_time).getTime() : Infinity;
+  if (Number.isNaN(start)) return false;
+
+  return start <= endOfDay.getTime() && end >= startOfDay.getTime() && start <= Date.now();
 }
 
 function stageIsRelevant(stage) {
   if (!stage) return false;
-  const now = Date.now();
-  const start = stage.start_time ? new Date(stage.start_time).getTime() : null;
-  const end = stage.end_time ? new Date(stage.end_time).getTime() : Infinity;
-  const startsToday = start && isToday(stage.start_time);
-  const isActive = start && start <= now && now <= end;
-  return Boolean(startsToday || isActive);
+  return (
+    isToday(stage.start_time) ||
+    isToday(stage.end_time) ||
+    isWithinHours(stage.start_time, RECENT_START_HOURS) ||
+    stageWindowOverlapsToday(stage)
+  );
 }
 
-function dropIsMintingToday(drop) {
+function dropBelongsOnTodaysList(drop) {
   if (drop.is_minting === true) return true;
-
-  const stages = [
-    drop.active_stage,
-    drop.next_stage,
-    ...(drop.stages || [])
-  ].filter(Boolean);
-
-  if (stages.some(stageIsRelevant)) return true;
-
-  if (stages.length === 0) {
-    const max = Number(drop.max_supply || drop.maxSupply || Infinity);
-    const total = Number(drop.total_supply || drop.totalSupply || 0);
-    return total < max;
+  if (isToday(drop.created_date) || isWithinHours(drop.created_date, RECENT_START_HOURS)) {
+    return true;
   }
+
+  const stages = allStages(drop);
+  const recentlyMinted = String(drop.source || '').includes('recently_minted');
+  const soldOut = isSoldOut(drop);
+
+  if (recentlyMinted) return true;
+  if (stages.some(s => isToday(s.start_time) || isToday(s.end_time) || isWithinHours(s.start_time, RECENT_START_HOURS))) {
+    return true;
+  }
+  if (!soldOut && stages.some(stageWindowOverlapsToday)) return true;
 
   return false;
 }
@@ -153,10 +179,13 @@ function formatPrice(stage) {
 }
 
 function formatSupply(drop) {
-  if (drop.maxSupply == null && drop.max_supply == null) return 'Check site';
+  if (drop.maxSupply == null && drop.max_supply == null) {
+    return drop.mintedOut ? 'Minted out' : 'Check site';
+  }
   const total = drop.totalSupply ?? drop.total_supply ?? 0;
   const max = drop.maxSupply ?? drop.max_supply;
-  return `${total} / ${max}`;
+  const supply = `${total} / ${max}`;
+  return drop.mintedOut || isSoldOut(drop) ? `${supply} · Minted out` : supply;
 }
 
 function formatStart(stage) {
@@ -200,7 +229,7 @@ function dateRangeIncludesToday(text) {
 }
 
 function normalizeDrop(drop) {
-  const stages = (drop.stages || []).filter(Boolean);
+  const stages = allStages(drop);
   const relevant = stages.filter(stageIsRelevant);
   return {
     name: drop.collection_name || drop.name,
@@ -210,6 +239,7 @@ function normalizeDrop(drop) {
     image: drop.image_url || drop.image || null,
     maxSupply: drop.max_supply ?? drop.maxSupply ?? null,
     totalSupply: drop.total_supply ?? drop.totalSupply ?? null,
+    mintedOut: isSoldOut(drop),
     stages: relevant.length > 0 ? relevant : stages.slice(0, 1),
     source: drop.source || 'opensea'
   };
@@ -217,6 +247,8 @@ function normalizeDrop(drop) {
 
 function sortDrops(drops) {
   return [...drops].sort((a, b) => {
+    const soldCmp = Number(Boolean(a.mintedOut)) - Number(Boolean(b.mintedOut));
+    if (soldCmp !== 0) return soldCmp;
     const chainCmp = Number(isRobinhood(b)) - Number(isRobinhood(a));
     if (chainCmp !== 0) return chainCmp;
     return String(a.name || '').localeCompare(String(b.name || ''));
@@ -243,7 +275,7 @@ async function mapPool(items, concurrency, fn) {
 }
 
 // ---------- OpenSea ----------
-async function fetchOpenSeaPages(type, chains) {
+async function fetchOpenSeaPages(type, chains, maxPages = MAX_OPENSEA_PAGES) {
   const drops = [];
   let cursor;
   let pages = 0;
@@ -266,7 +298,7 @@ async function fetchOpenSeaPages(type, chains) {
       console.log(`OpenSea ${type} / ${chains} failed:`, err.message);
       break;
     }
-  } while (cursor && pages < MAX_OPENSEA_PAGES);
+  } while (cursor && pages < maxPages);
 
   return drops;
 }
@@ -294,18 +326,23 @@ async function enrichOpenSeaDrop(drop) {
     project_url: collection.project_url,
     twitter_username: collection.twitter_username,
     discord_url: collection.discord_url,
-    owner: collection.owner
+    owner: collection.owner,
+    created_date: collection.created_date
   };
 }
 
 async function fetchOpenSeaDrops() {
   const chainAttempts = ['ethereum,robinhood', 'ethereum', 'robinhood'];
-  const types = ['upcoming', 'featured', 'recently_minted'];
+  const typeAttempts = [
+    { type: 'recently_minted', pages: MAX_OPENSEA_PAGES },
+    { type: 'featured', pages: MAX_OPENSEA_PAGES },
+    { type: 'upcoming', pages: MAX_OPENSEA_PAGES }
+  ];
   const resultsMap = new Map();
 
   for (const chains of chainAttempts) {
-    for (const type of types) {
-      const drops = await fetchOpenSeaPages(type, chains);
+    for (const { type, pages } of typeAttempts) {
+      const drops = await fetchOpenSeaPages(type, chains, pages);
       for (const drop of drops) {
         const slug = drop.collection_slug;
         if (!slug || resultsMap.has(slug)) continue;
@@ -322,8 +359,7 @@ async function fetchOpenSeaDrops() {
   for (const drop of enriched) {
     if (!isAllowedChain(drop.chain)) continue;
     if (isOrangeHare(drop)) continue;
-    if (!dropIsMintingToday(drop)) continue;
-    if (isSoldOut(drop)) continue;
+    if (!dropBelongsOnTodaysList(drop)) continue;
     kept.push(normalizeDrop(drop));
   }
 
@@ -373,7 +409,9 @@ async function fetchNftCalendarFallback(existingSlugs = new Set()) {
           dateRangeIncludesToday(container.text()) ||
           todayTokens.some(token => text.includes(token)) ||
           text.includes('today') ||
-          text.includes('minting now');
+          text.includes('minting now') ||
+          text.includes('minted out') ||
+          text.includes('sold out');
 
         if (!mentionsToday) return;
 
@@ -394,6 +432,7 @@ async function fetchNftCalendarFallback(existingSlugs = new Set()) {
           image: container.find('img').attr('src') || container.find('img').attr('data-src') || null,
           maxSupply: null,
           totalSupply: null,
+          mintedOut: text.includes('minted out') || text.includes('sold out'),
           stages: [{ label: 'Check site / Live', start_time: new Date().toISOString(), price: null }],
           source: 'nftcalendar'
         });
@@ -416,6 +455,7 @@ async function getTodaysMints() {
 
 // ---------- Embeds: one compact list with small thumbnails ----------
 function buildListEmbeds(drops) {
+  const mintedOutCount = drops.filter(d => d.mintedOut).length;
   const rhCount = drops.filter(isRobinhood).length;
   const ethCount = drops.length - rhCount;
   const today = pacificNow().toLocaleDateString('en-US', {
@@ -454,7 +494,7 @@ function buildListEmbeds(drops) {
       embed
         .setTitle(`Today's NFT Mints · ${today}`)
         .setFooter({
-          text: `${drops.length} projects · 🟢 Robinhood ${rhCount} · 🟣 Ethereum ${ethCount}`
+          text: `${drops.length} projects · 🟢 Robinhood ${rhCount} · 🟣 Ethereum ${ethCount} · ${mintedOutCount} minted out`
         })
         .setTimestamp();
     } else {
@@ -470,7 +510,7 @@ function buildThumbEmbed(drop) {
   const embed = new EmbedBuilder()
     .setTitle(drop.name)
     .setURL(drop.url)
-    .setColor(isRobinhood(drop) ? 0x00c805 : 0x627eea)
+    .setColor(drop.mintedOut ? 0x888888 : isRobinhood(drop) ? 0x00c805 : 0x627eea)
     .setDescription(
       `**${chainLabel(drop)}** · ${formatSupply(drop)} · ${formatPrice(stage)}\n${stage?.label || stage?.stage_type || 'Mint'} · ${formatStart(stage)} PST`
     )
