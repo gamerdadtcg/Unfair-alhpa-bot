@@ -5,13 +5,37 @@ const {
   EmbedBuilder,
   REST,
   Routes,
-  SlashCommandBuilder
+  SlashCommandBuilder,
+  Events
 } = require('discord.js');
 const cron = require('node-cron');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const fs = require('fs');
+const path = require('path');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+function log(message) {
+  console.log(String(message).replace(/\s+/g, ' ').slice(0, 400));
+}
+
+function logError(label, err) {
+  const status = err?.status ?? err?.response?.status ?? err?.code;
+  const msg = err?.rawError?.message || err?.message || String(err);
+  log(`${label}${status ? ` (${status})` : ''}: ${msg}`);
+}
+
+function safeImageUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
 
 const OPENSEA_HEADERS = {
   Accept: 'application/json',
@@ -22,6 +46,10 @@ const ALLOWED_CHAINS = new Set(['ethereum', 'robinhood']);
 const EMBEDS_PER_MESSAGE = 10;
 const MAX_OPENSEA_PAGES = 8;
 const RECENT_START_HOURS = 48;
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+const POSTED_TTL_MS = 24 * 60 * 60 * 1000;
+const STATE_FILE = path.join(__dirname, 'data', 'state.json');
+const GOPLUS_CHAIN_IDS = { ethereum: '1', robinhood: '4663' };
 const ORANGEHARE_RE = /orange[\s_-]*hare/i;
 const ORANGEHARE_SLUGS = new Set([
   'orangehare-exclusives',
@@ -241,7 +269,10 @@ function normalizeDrop(drop) {
     totalSupply: drop.total_supply ?? drop.totalSupply ?? null,
     mintedOut: isSoldOut(drop),
     stages: relevant.length > 0 ? relevant : stages.slice(0, 1),
-    source: drop.source || 'opensea'
+    source: drop.source || 'opensea',
+    contractAddress: drop.contract_address || drop.contractAddress || drop.contracts?.[0]?.address || null,
+    isDisabled: drop.is_disabled ?? drop.isDisabled ?? false,
+    safelistStatus: drop.safelist_status || drop.safelistStatus || null
   };
 }
 
@@ -274,6 +305,148 @@ async function mapPool(items, concurrency, fn) {
   return results;
 }
 
+// ---------- Remember posted drops ----------
+function defaultState() {
+  return { lastManualDropsAt: 0, posted: {}, safety: {} };
+}
+
+function loadState() {
+  try {
+    return { ...defaultState(), ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) };
+  } catch {
+    return defaultState();
+  }
+}
+
+function saveState(state) {
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state));
+}
+
+function pruneState(state) {
+  const cutoff = Date.now() - POSTED_TTL_MS;
+  for (const [slug, at] of Object.entries(state.posted || {})) {
+    if (at < cutoff) delete state.posted[slug];
+  }
+  for (const [key, entry] of Object.entries(state.safety || {})) {
+    if (!entry?.at || entry.at < cutoff) delete state.safety[key];
+  }
+  return state;
+}
+
+function wasPostedRecently(state, slug) {
+  const at = state.posted?.[slug];
+  return Boolean(at && Date.now() - at < POSTED_TTL_MS);
+}
+
+function markPosted(slugs, { manual = false } = {}) {
+  const state = pruneState(loadState());
+  const now = Date.now();
+  if (manual) state.lastManualDropsAt = now;
+  for (const slug of slugs) {
+    if (slug) state.posted[slug] = now;
+  }
+  saveState(state);
+}
+
+function usedDropsRecently() {
+  const state = loadState();
+  return Date.now() - (state.lastManualDropsAt || 0) < SIX_HOURS_MS;
+}
+
+async function fetchJson(url, options = {}) {
+  try {
+    const res = await axios.get(url, { timeout: 8000, ...options });
+    return res.data;
+  } catch {
+    return null;
+  }
+}
+
+async function isExplorerVerified(chain, address) {
+  if (chain === 'robinhood') {
+    const v2 = await fetchJson(`https://robinhoodchain.blockscout.com/api/v2/smart-contracts/${address}`);
+    if (v2 && (v2.is_verified || v2.is_fully_verified)) return true;
+    const legacy = await fetchJson('https://robinhoodchain.blockscout.com/api', {
+      params: { module: 'contract', action: 'getsourcecode', address }
+    });
+    return Boolean(legacy?.result?.[0]?.SourceCode);
+  }
+
+  const v2 = await fetchJson(`https://eth.blockscout.com/api/v2/smart-contracts/${address}`);
+  if (v2 && (v2.is_verified || v2.is_fully_verified)) return true;
+
+  const params = {
+    chainid: 1,
+    module: 'contract',
+    action: 'getsourcecode',
+    address
+  };
+  if (process.env.ETHERSCAN_API_KEY) params.apikey = process.env.ETHERSCAN_API_KEY;
+  const etherscan = await fetchJson('https://api.etherscan.io/v2/api', { params });
+  return Boolean(etherscan?.result?.[0]?.SourceCode);
+}
+
+async function goplusNftFlags(chain, address) {
+  const chainId = GOPLUS_CHAIN_IDS[chain];
+  if (!chainId) return {};
+  const data = await fetchJson(`https://api.gopluslabs.io/api/v1/nft_security/${chainId}`, {
+    params: { contract_addresses: address }
+  });
+  const result = data?.result;
+  if (!result || typeof result !== 'object') return {};
+  if (result.malicious_nft_contract != null || result.nft_open_source != null) return result;
+  return result[address] || result[address.toLowerCase()] || {};
+}
+
+function looksMalicious(drop, flags = {}) {
+  if (drop.isDisabled || drop.is_disabled) return true;
+  const status = String(drop.safelistStatus || drop.safelist_status || '').toLowerCase();
+  if (status === 'disabled' || status.includes('malware') || status.includes('spam')) return true;
+  const malicious = flags.malicious_nft_contract;
+  return malicious === '1' || malicious === 1 || malicious === true;
+}
+
+function isOpenSourceFlag(flags = {}) {
+  const open = flags.nft_open_source;
+  return open === '1' || open === 1 || open === true;
+}
+
+async function dropIsSafeAndVerified(drop) {
+  if (looksMalicious(drop)) return false;
+
+  const address = drop.contractAddress || drop.contract_address;
+  if (!address) return false;
+
+  const chain = chainOf(drop);
+  const flags = await goplusNftFlags(chain, address);
+  if (looksMalicious(drop, flags)) return false;
+  if (isOpenSourceFlag(flags)) return true;
+  return isExplorerVerified(chain, address);
+}
+
+async function cachedSafety(drop, state) {
+  const address = String(drop.contractAddress || drop.contract_address || '').toLowerCase();
+  const key = `${chainOf(drop)}:${address || drop.slug}`;
+  const hit = state.safety?.[key];
+  if (hit && Date.now() - hit.at < SIX_HOURS_MS) return hit.ok;
+
+  const ok = await dropIsSafeAndVerified(drop);
+  state.safety = state.safety || {};
+  state.safety[key] = { ok, at: Date.now() };
+  return ok;
+}
+
+async function filterSafeVerified(drops) {
+  const state = pruneState(loadState());
+  const checked = await mapPool(drops, 4, async drop => ({
+    drop,
+    ok: await cachedSafety(drop, state)
+  }));
+  saveState(state);
+  return checked.filter(item => item.ok).map(item => item.drop);
+}
+
 // ---------- OpenSea ----------
 async function fetchOpenSeaPages(type, chains, maxPages = MAX_OPENSEA_PAGES) {
   const drops = [];
@@ -295,7 +468,7 @@ async function fetchOpenSeaPages(type, chains, maxPages = MAX_OPENSEA_PAGES) {
       cursor = res.data.next || null;
       pages += 1;
     } catch (err) {
-      console.log(`OpenSea ${type} / ${chains} failed:`, err.message);
+      logError(`OpenSea ${type} / ${chains} failed`, err);
       break;
     }
   } while (cursor && pages < maxPages);
@@ -327,12 +500,16 @@ async function enrichOpenSeaDrop(drop) {
     twitter_username: collection.twitter_username,
     discord_url: collection.discord_url,
     owner: collection.owner,
-    created_date: collection.created_date
+    created_date: collection.created_date,
+    is_disabled: collection.is_disabled,
+    safelist_status: collection.safelist_status,
+    contracts: collection.contracts,
+    contract_address: drop.contract_address || detail.contract_address || collection.contracts?.[0]?.address
   };
 }
 
 async function fetchOpenSeaDrops() {
-  const chainAttempts = ['ethereum,robinhood', 'ethereum', 'robinhood'];
+  const chainAttempts = ['ethereum,robinhood'];
   const typeAttempts = [
     { type: 'recently_minted', pages: MAX_OPENSEA_PAGES },
     { type: 'featured', pages: MAX_OPENSEA_PAGES },
@@ -438,7 +615,7 @@ async function fetchNftCalendarFallback(existingSlugs = new Set()) {
         });
       });
     } catch (err) {
-      console.log(`nftcalendar scrape failed (${page.url}):`, err.message);
+      logError(`nftcalendar scrape failed (${page.url})`, err);
     }
   }
 
@@ -446,11 +623,17 @@ async function fetchNftCalendarFallback(existingSlugs = new Set()) {
 }
 
 // ---------- Combine ----------
-async function getTodaysMints() {
+async function getTodaysMints({ skipPosted = false } = {}) {
   const openSea = await fetchOpenSeaDrops();
   const existing = new Set(openSea.map(d => d.slug));
   const fallback = await fetchNftCalendarFallback(existing);
-  return sortDrops([...openSea, ...fallback].filter(drop => !isOrangeHare(drop)));
+  let drops = sortDrops([...openSea, ...fallback].filter(drop => !isOrangeHare(drop)));
+  drops = await filterSafeVerified(drops);
+  if (skipPosted) {
+    const state = loadState();
+    drops = drops.filter(drop => !wasPostedRecently(state, drop.slug));
+  }
+  return drops;
 }
 
 // ---------- Embeds: one compact list with small thumbnails ----------
@@ -516,7 +699,8 @@ function buildThumbEmbed(drop) {
     )
     .setFooter({ text: `Source: ${drop.source}` });
 
-  if (drop.image) embed.setThumbnail(drop.image);
+  const image = safeImageUrl(drop.image);
+  if (image) embed.setThumbnail(image);
   return embed;
 }
 
@@ -531,23 +715,31 @@ function chunk(items, size) {
 async function sendPayloads(channel, payloads, isSlash) {
   for (let i = 0; i < payloads.length; i++) {
     const payload = payloads[i];
-    if (isSlash) {
-      if (i === 0) await channel.editReply(payload);
-      else await channel.followUp(payload);
-    } else {
-      await channel.send(payload);
+    try {
+      if (isSlash) {
+        if (i === 0) await channel.editReply(payload);
+        else await channel.followUp(payload);
+      } else {
+        await channel.send(payload);
+      }
+    } catch (err) {
+      logError(`Failed to post mint batch ${i + 1}/${payloads.length}`, err);
+    }
+    if (i < payloads.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 1200));
     }
   }
 }
 
 // ---------- Post ----------
-async function postDrops(channel, isSlash = false) {
-  const drops = await getTodaysMints();
+async function postDrops(channel, { isSlash = false, skipPosted = false } = {}) {
+  const drops = await getTodaysMints({ skipPosted });
 
   if (drops.length === 0) {
-    const msg = 'No active ETH or Robinhood Chain mints found right now.';
+    const msg = 'No verified ETH or Robinhood mints to show right now.';
     if (isSlash) return channel.editReply({ content: msg });
-    return channel.send(msg);
+    log('Scheduled post skipped: nothing new after filters.');
+    return;
   }
 
   const listEmbeds = buildListEmbeds(drops);
@@ -568,49 +760,79 @@ async function postDrops(channel, isSlash = false) {
   }
 
   await sendPayloads(channel, payloads, isSlash);
+  markPosted(drops.map(drop => drop.slug), { manual: isSlash });
 }
 
 // ---------- Slash Command ----------
 const commands = [
   new SlashCommandBuilder()
     .setName('drops')
-    .setDescription("Show today's ETH + Robinhood NFT mints")
+    .setDescription("Show today's verified ETH + Robinhood NFT mints")
 ].map(c => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
-  console.log('Slash commands registered');
+  log('Slash commands registered');
 }
 
-// ---------- Events ----------
-client.once('ready', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  await registerCommands();
-});
+async function onReady() {
+  log(`Logged in as ${client.user.tag}`);
+  try {
+    await registerCommands();
+  } catch (err) {
+    logError('Failed to register slash commands', err);
+  }
+}
+
+client.once(Events.ClientReady ?? 'clientReady', onReady);
 
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== 'drops') return;
 
-  if (interaction.commandName === 'drops') {
+  try {
     await interaction.deferReply();
-    await postDrops(interaction, true);
+    await postDrops(interaction, { isSlash: true });
+  } catch (err) {
+    logError('/drops failed', err);
+    try {
+      const msg = "Could not fetch today's mints. Try again in a minute.";
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: msg });
+      } else {
+        await interaction.reply({ content: msg, ephemeral: true });
+      }
+    } catch (_) {
+      // ignore follow-up failures
+    }
   }
 });
 
-// ---------- Daily at 12:00 AM PST ----------
 cron.schedule(
-  '0 0 * * *',
+  '0 */6 * * *',
   async () => {
-    console.log('Running daily mint alert...');
+    if (usedDropsRecently()) {
+      log('Skipping scheduled post; /drops was used in the last 6 hours.');
+      return;
+    }
+    log('Running 6-hour mint alert...');
     try {
       const channel = await client.channels.fetch(process.env.CHANNEL_ID);
-      await postDrops(channel, false);
+      await postDrops(channel, { skipPosted: true });
     } catch (err) {
-      console.error('Daily post failed:', err);
+      logError('Scheduled post failed', err);
     }
   },
   { timezone: 'America/Los_Angeles' }
 );
+
+process.on('unhandledRejection', err => {
+  logError('Unhandled rejection', err);
+});
+
+process.on('uncaughtException', err => {
+  logError('Uncaught exception', err);
+});
 
 client.login(process.env.DISCORD_TOKEN);
