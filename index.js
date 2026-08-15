@@ -256,44 +256,53 @@ function formatSupply(drop) {
   return drop.mintedOut || isSoldOut(drop) ? `${supply} · Minted out` : supply;
 }
 
+function dropStartTime(drop) {
+  const stage = (drop.stages || [])[0];
+  const raw = stage?.start_time || drop.created_date || drop.calendarStart;
+  const t = raw ? new Date(raw).getTime() : NaN;
+  return Number.isNaN(t) ? Number.POSITIVE_INFINITY : t;
+}
+
+function dropDateKey(drop) {
+  const t = dropStartTime(drop);
+  if (!Number.isFinite(t)) return 'Unknown date';
+  return new Date(t).toLocaleDateString('en-US', {
+    timeZone: 'America/Los_Angeles',
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric'
+  });
+}
+
 function formatStart(stage) {
   if (!stage?.start_time) return 'TBD';
-  return new Date(stage.start_time).toLocaleString('en-US', {
+  const start = new Date(stage.start_time);
+  if (Number.isNaN(start.getTime())) return 'TBD';
+
+  // Calendar windows often only have a day — show the range cleanly when present.
+  if (stage.end_time) {
+    const end = new Date(stage.end_time);
+    if (!Number.isNaN(end.getTime())) {
+      const sameDay =
+        start.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' }) ===
+        end.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+      if (!sameDay) {
+        const fmt = value =>
+          value.toLocaleDateString('en-US', {
+            timeZone: 'America/Los_Angeles',
+            month: 'short',
+            day: 'numeric'
+          });
+        return `${fmt(start)} – ${fmt(end)}`;
+      }
+    }
+  }
+
+  return start.toLocaleString('en-US', {
     timeZone: 'America/Los_Angeles',
     dateStyle: 'short',
     timeStyle: 'short'
   });
-}
-
-function todayDateTokens() {
-  const today = pacificNow();
-  const monthLong = today.toLocaleString('en-US', { month: 'long' }).toLowerCase();
-  const monthShort = today.toLocaleString('en-US', { month: 'short' }).toLowerCase();
-  const day = today.getDate();
-  const year = today.getFullYear();
-  return [
-    `${monthShort} ${day}`,
-    `${monthLong} ${day}`,
-    `${monthShort} ${day}, ${year}`,
-    `${monthLong} ${day}, ${year}`
-  ];
-}
-
-function dateRangeIncludesToday(text) {
-  const match = String(text || '').match(
-    /([A-Za-z]{3,9}\s+\d{1,2},?\s*\d{4})\s*[–\-—to]+\s*([A-Za-z]{3,9}\s+\d{1,2},?\s*\d{4})/i
-  );
-  if (!match) return false;
-
-  const start = new Date(match[1]);
-  const end = new Date(match[2]);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return false;
-
-  const today = pacificNow();
-  today.setHours(0, 0, 0, 0);
-  start.setHours(0, 0, 0, 0);
-  end.setHours(23, 59, 59, 999);
-  return today >= start && today <= end;
 }
 
 function calendarRangeIsRelevant(startText, endText) {
@@ -331,8 +340,12 @@ function normalizeDrop(drop) {
 
 function sortDrops(drops) {
   return [...drops].sort((a, b) => {
+    const timeCmp = dropStartTime(a) - dropStartTime(b);
+    if (timeCmp !== 0) return timeCmp;
+
     const soldCmp = Number(Boolean(a.mintedOut)) - Number(Boolean(b.mintedOut));
     if (soldCmp !== 0) return soldCmp;
+
     const chainCmp = Number(isRobinhood(b)) - Number(isRobinhood(a));
     if (chainCmp !== 0) return chainCmp;
     return String(a.name || '').localeCompare(String(b.name || ''));
@@ -755,11 +768,23 @@ function buildListEmbeds(drops) {
     year: 'numeric'
   });
 
-  const lines = drops.map((drop, index) => {
+  const lines = [];
+  let lastDateKey = null;
+  let index = 0;
+  for (const drop of drops) {
+    const dateKey = dropDateKey(drop);
+    if (dateKey !== lastDateKey) {
+      lines.push(`**${dateKey}**`);
+      lastDateKey = dateKey;
+    }
+
+    index += 1;
     const stage = (drop.stages || [])[0];
     const icon = isRobinhood(drop) ? '🟢' : '🟣';
-    return `${icon} **${index + 1}. [${drop.name}](${drop.url})**\n${chainLabel(drop)} · ${formatSupply(drop)} · ${formatPrice(stage)} · ${formatStart(stage)} PST`;
-  });
+    lines.push(
+      `${icon} **${index}. [${drop.name}](${drop.url})**\n${chainLabel(drop)} · ${formatSupply(drop)} · ${formatPrice(stage)} · ${formatStart(stage)} PST`
+    );
+  }
 
   const descriptions = [];
   let current = [];
