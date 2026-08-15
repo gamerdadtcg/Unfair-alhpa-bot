@@ -190,8 +190,8 @@ function dropFitsTimeWindow(drop) {
     return !soldOut && drop.is_minting === true;
   }
 
-  // Ignore starts more than ~1 hour in the future.
-  if (age < -1) return false;
+  // Ignore future-dated starts — this list is last 24h / 8h only.
+  if (age < 0) return false;
   return age <= limitHours;
 }
 
