@@ -5,13 +5,35 @@ const {
   EmbedBuilder,
   REST,
   Routes,
-  SlashCommandBuilder
+  SlashCommandBuilder,
+  Events
 } = require('discord.js');
 const cron = require('node-cron');
 const axios = require('axios');
 const cheerio = require('cheerio');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+function log(message) {
+  console.log(String(message).replace(/\s+/g, ' ').slice(0, 400));
+}
+
+function logError(label, err) {
+  const status = err?.status ?? err?.response?.status ?? err?.code;
+  const msg = err?.rawError?.message || err?.message || String(err);
+  log(`${label}${status ? ` (${status})` : ''}: ${msg}`);
+}
+
+function safeImageUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
 
 const OPENSEA_HEADERS = {
   Accept: 'application/json',
@@ -295,7 +317,7 @@ async function fetchOpenSeaPages(type, chains, maxPages = MAX_OPENSEA_PAGES) {
       cursor = res.data.next || null;
       pages += 1;
     } catch (err) {
-      console.log(`OpenSea ${type} / ${chains} failed:`, err.message);
+      logError(`OpenSea ${type} / ${chains} failed`, err);
       break;
     }
   } while (cursor && pages < maxPages);
@@ -332,7 +354,7 @@ async function enrichOpenSeaDrop(drop) {
 }
 
 async function fetchOpenSeaDrops() {
-  const chainAttempts = ['ethereum,robinhood', 'ethereum', 'robinhood'];
+  const chainAttempts = ['ethereum,robinhood'];
   const typeAttempts = [
     { type: 'recently_minted', pages: MAX_OPENSEA_PAGES },
     { type: 'featured', pages: MAX_OPENSEA_PAGES },
@@ -438,7 +460,7 @@ async function fetchNftCalendarFallback(existingSlugs = new Set()) {
         });
       });
     } catch (err) {
-      console.log(`nftcalendar scrape failed (${page.url}):`, err.message);
+      logError(`nftcalendar scrape failed (${page.url})`, err);
     }
   }
 
@@ -516,7 +538,8 @@ function buildThumbEmbed(drop) {
     )
     .setFooter({ text: `Source: ${drop.source}` });
 
-  if (drop.image) embed.setThumbnail(drop.image);
+  const image = safeImageUrl(drop.image);
+  if (image) embed.setThumbnail(image);
   return embed;
 }
 
@@ -531,11 +554,18 @@ function chunk(items, size) {
 async function sendPayloads(channel, payloads, isSlash) {
   for (let i = 0; i < payloads.length; i++) {
     const payload = payloads[i];
-    if (isSlash) {
-      if (i === 0) await channel.editReply(payload);
-      else await channel.followUp(payload);
-    } else {
-      await channel.send(payload);
+    try {
+      if (isSlash) {
+        if (i === 0) await channel.editReply(payload);
+        else await channel.followUp(payload);
+      } else {
+        await channel.send(payload);
+      }
+    } catch (err) {
+      logError(`Failed to post mint batch ${i + 1}/${payloads.length}`, err);
+    }
+    if (i < payloads.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 1200));
     }
   }
 }
@@ -580,37 +610,62 @@ const commands = [
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
-  console.log('Slash commands registered');
+  log('Slash commands registered');
 }
 
-// ---------- Events ----------
-client.once('ready', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  await registerCommands();
-});
+async function onReady() {
+  log(`Logged in as ${client.user.tag}`);
+  try {
+    await registerCommands();
+  } catch (err) {
+    logError('Failed to register slash commands', err);
+  }
+}
+
+client.once(Events.ClientReady ?? 'clientReady', onReady);
 
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== 'drops') return;
 
-  if (interaction.commandName === 'drops') {
+  try {
     await interaction.deferReply();
     await postDrops(interaction, true);
+  } catch (err) {
+    logError('/drops failed', err);
+    try {
+      const msg = "Could not fetch today's mints. Try again in a minute.";
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: msg });
+      } else {
+        await interaction.reply({ content: msg, ephemeral: true });
+      }
+    } catch (_) {
+      // ignore follow-up failures
+    }
   }
 });
 
-// ---------- Daily at 12:00 AM PST ----------
 cron.schedule(
   '0 0 * * *',
   async () => {
-    console.log('Running daily mint alert...');
+    log('Running daily mint alert...');
     try {
       const channel = await client.channels.fetch(process.env.CHANNEL_ID);
       await postDrops(channel, false);
     } catch (err) {
-      console.error('Daily post failed:', err);
+      logError('Daily post failed', err);
     }
   },
   { timezone: 'America/Los_Angeles' }
 );
+
+process.on('unhandledRejection', err => {
+  logError('Unhandled rejection', err);
+});
+
+process.on('uncaughtException', err => {
+  logError('Uncaught exception', err);
+});
 
 client.login(process.env.DISCORD_TOKEN);
