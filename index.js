@@ -150,16 +150,12 @@ function hoursSince(isoString) {
   return (Date.now() - t) / 36e5;
 }
 
-// Best-effort age for when a drop sold out / last had mint activity.
-function soldOutAgeHours(drop) {
+// Age from mint start (not calendar end dates — those falsely keep old sold-outs).
+function dropStartAgeHours(drop) {
   const stages = allStages(drop);
   let bestAge = Infinity;
 
   for (const stage of stages) {
-    if (stage?.end_time) {
-      const age = hoursSince(stage.end_time);
-      if (age >= 0) bestAge = Math.min(bestAge, age);
-    }
     if (stage?.start_time) {
       const age = hoursSince(stage.start_time);
       if (age >= 0) bestAge = Math.min(bestAge, age);
@@ -171,36 +167,38 @@ function soldOutAgeHours(drop) {
     if (age >= 0) bestAge = Math.min(bestAge, age);
   }
 
+  if (drop.calendarStart) {
+    const age = hoursSince(new Date(drop.calendarStart));
+    if (age >= 0) bestAge = Math.min(bestAge, age);
+  }
+
   return bestAge;
 }
 
 function soldOutWithinHours(drop, hours = SOLD_OUT_MAX_AGE_HOURS) {
-  const age = soldOutAgeHours(drop);
+  const age = dropStartAgeHours(drop);
   return Number.isFinite(age) && age <= hours;
 }
 
-// Available supply = last 24h. Minted out = last 8h.
+// Available supply: live now OR started in last 24h.
+// Minted out: started / sold out within last 8h.
 function dropFitsTimeWindow(drop) {
   const soldOut = Boolean(drop.mintedOut) || isSoldOut(drop);
+
+  // Still has supply and is actively minting — keep it.
+  if (!soldOut && drop.is_minting === true) return true;
+
+  const age = dropStartAgeHours(drop);
   const limitHours = soldOut ? SOLD_OUT_MAX_AGE_HOURS : MINT_LOOKBACK_HOURS;
-  const age = soldOutAgeHours(drop);
 
-  if (!Number.isFinite(age)) {
-    // No usable timestamp: only keep live, still-available mints.
-    return !soldOut && drop.is_minting === true;
-  }
-
-  // Ignore future-dated starts — this list is last 24h / 8h only.
+  if (!Number.isFinite(age)) return false;
   if (age < 0) return false;
   return age <= limitHours;
 }
 
 function stageIsRelevant(stage) {
   if (!stage) return false;
-  return (
-    isWithinHours(stage.start_time, MINT_LOOKBACK_HOURS) ||
-    isWithinHours(stage.end_time, SOLD_OUT_MAX_AGE_HOURS)
-  );
+  return isWithinHours(stage.start_time, MINT_LOOKBACK_HOURS);
 }
 
 function dropBelongsOnTodaysList(drop) {
@@ -281,7 +279,7 @@ function calendarRangeIsRelevant(startText, endText, { mintedOut = false } = {})
   if (Number.isNaN(start.getTime())) return false;
 
   const ageHours = (Date.now() - start.getTime()) / 36e5;
-  if (ageHours < -1) return false;
+  if (ageHours < 0) return false;
 
   const limitHours = mintedOut ? SOLD_OUT_MAX_AGE_HOURS : MINT_LOOKBACK_HOURS;
   return ageHours <= limitHours;
@@ -299,6 +297,7 @@ function normalizeDrop(drop) {
     maxSupply: drop.max_supply ?? drop.maxSupply ?? null,
     totalSupply: drop.total_supply ?? drop.totalSupply ?? null,
     mintedOut: Boolean(drop.mintedOut) || isSoldOut(drop),
+    is_minting: drop.is_minting === true,
     stages: relevant.length > 0 ? relevant : stages.slice(0, 1),
     source: drop.source || 'opensea',
     contractAddress: drop.contract_address || drop.contractAddress || drop.contracts?.[0]?.address || null,
@@ -448,8 +447,7 @@ function isOpenSourceFlag(flags = {}) {
 }
 
 async function dropIsSafeAndVerified(drop) {
-  // Robinhood: only block explicitly disabled collections. GoPlus/explorer
-  // checks hide too many real RH mints compared with Ethereum.
+  // Robinhood: only block explicitly disabled collections.
   if (isRobinhood(drop)) {
     return !(drop.isDisabled || drop.is_disabled);
   }
@@ -457,7 +455,10 @@ async function dropIsSafeAndVerified(drop) {
   if (looksMalicious(drop)) return false;
 
   const address = drop.contractAddress || drop.contract_address;
-  if (!address) return false;
+  // NFT Calendar ETH rows often lack contracts; keep them unless disabled.
+  if (!address) {
+    return String(drop.source || '').includes('nftcalendar');
+  }
 
   const chain = chainOf(drop);
   const flags = await goplusNftFlags(chain, address);
@@ -468,8 +469,7 @@ async function dropIsSafeAndVerified(drop) {
 
 async function cachedSafety(drop, state) {
   const address = String(drop.contractAddress || drop.contract_address || '').toLowerCase();
-  // Bump key version whenever Robinhood safety rules change.
-  const key = `v3:${chainOf(drop)}:${address || drop.slug}`;
+  const key = `v4:${chainOf(drop)}:${address || drop.slug}`;
   const hit = state.safety?.[key];
   if (hit && Date.now() - hit.at < SIX_HOURS_MS) return hit.ok;
 
