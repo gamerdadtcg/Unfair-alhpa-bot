@@ -43,10 +43,14 @@ async function deliverDigest(digest, { interaction } = {}) {
   }
 }
 
-async function runMorning({ interaction = null, applyPostedDedupe = true } = {}) {
+async function runMorning({
+  interaction = null,
+  applyPostedDedupe = true,
+  markAsPosted = true
+} = {}) {
   const result = await runPipeline({ applyPostedDedupe });
   await deliverDigest(result.digest, { interaction });
-  if (result.items.length) markPosted(result.items);
+  if (markAsPosted && result.items.length) markPosted(result.items);
   return result;
 }
 
@@ -79,7 +83,7 @@ client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== 'drops') return;
   try {
     await interaction.deferReply({ ephemeral: false });
-    await runMorning({ interaction, applyPostedDedupe: false });
+    await runMorning({ interaction, applyPostedDedupe: false, markAsPosted: false });
   } catch (err) {
     logError('/drops failed', err);
     try {

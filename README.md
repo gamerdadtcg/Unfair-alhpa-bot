@@ -17,8 +17,9 @@ src/
   enrich.js                   Blockscout verified + holders
   collectors/
     opensea.js                drops + new collections (ETH + RH)
-    ethMints.js               Transfer-from-zero via Alchemy or eth_getLogs
-    rhMints.js                Blockscout NFT tokens on 4663
+    mintLogs.js               ERC-721/1155 Transfer-from-zero (Alchemy or logs)
+    ethMints.js               ETH on-chain first mints
+    rhMints.js                RH Blockscout NFTs + RH_RPC mint logs
   delivery/webhook.js         Discord webhook adapter
   fixtures/                   mocked good / farm / repeat mints
 data/blacklist.json           deployer + slug blacklist
@@ -67,7 +68,7 @@ npm test
 
 Morning job: `0 7 * * *` America/Los_Angeles. One message. Max 8 mints, score ≥ 60 (falls back to 50 once if fewer than 3 pass). Never pads with junk.
 
-`/drops` runs the same pipeline and posts the same single digest. It does not drip individual cards.
+`/drops` runs the same pipeline and posts the same single digest. It does **not** drip individual cards, and it does **not** mark collections as posted (so a 6am `/drops` cannot empty the 7am GM ALPHA).
 
 ## Quality bar
 

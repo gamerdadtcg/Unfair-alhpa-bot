@@ -56,6 +56,19 @@ function formatDateHeader(date = new Date()) {
   });
 }
 
+function itemBlock(c, i, { boldName = false } = {}) {
+  const title = boldName ? `**${i + 1}. ${c.name}**` : `${i + 1}. ${c.name}`;
+  return [
+    title,
+    `   Chain: ${chainTag(c.chain)}`,
+    `   Status: ${statusLine(c)}`,
+    `   Price: ${c.priceLabel || 'TBD'} | Supply: ${supplyLine(c)}`,
+    `   Why: ${c.why}`,
+    `   Links: ${linkParts(c)}`,
+    `   Contract: ${shortAddr(c.contractAddress)}`
+  ].join('\n');
+}
+
 function formatDigest(items, { date } = {}) {
   const headerDate = formatDateHeader(date);
   if (!items.length) {
@@ -65,30 +78,18 @@ function formatDigest(items, { date } = {}) {
     };
   }
 
-  const lines = items.map((c, i) => {
-    return [
-      `**${i + 1}. ${c.name}**`,
-      `Chain: ${chainTag(c.chain)}`,
-      `Status: ${statusLine(c)}`,
-      `Price: ${c.priceLabel || 'TBD'} | Supply: ${supplyLine(c)}`,
-      `Why: ${c.why}`,
-      `Links: ${linkParts(c)}`,
-      `Contract: ${shortAddr(c.contractAddress)}`
-    ].join('\n');
-  });
-
   const text = [
     `GM ALPHA — ${headerDate} — ETH + ROBINHOOD`,
     `${items.length} mint${items.length === 1 ? '' : 's'} worth looking at. Ranked.`,
     '',
-    lines.join('\n\n')
+    items.map((c, i) => itemBlock(c, i, { boldName: false })).join('\n\n')
   ].join('\n');
 
   const content = [
     `**GM ALPHA — ${headerDate} — ETH + ROBINHOOD**`,
     `${items.length} mint${items.length === 1 ? '' : 's'} worth looking at. Ranked.`,
     '',
-    lines.join('\n\n')
+    items.map((c, i) => itemBlock(c, i, { boldName: true })).join('\n\n')
   ].join('\n');
 
   return { content, text };

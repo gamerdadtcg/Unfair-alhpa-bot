@@ -31,7 +31,10 @@ function hoursSince(iso) {
 
 function activeStageKey(candidate) {
   const stage = (candidate.stages || []).find(s => s?.start_time) || (candidate.stages || [])[0];
-  return String(stage?.label || stage?.stage_type || candidate.status || '').toLowerCase();
+  const key = String(
+    stage?.label || stage?.stage_type || candidate.status || (candidate.isMinting ? 'live' : '')
+  ).toLowerCase();
+  return key || null;
 }
 
 function mintInWindow(candidate) {

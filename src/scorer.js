@@ -1,4 +1,4 @@
-const { hoursUntil } = require('./filters');
+const { hoursUntil, activeStageKey } = require('./filters');
 
 function clamp(n, max) {
   return Math.max(0, Math.min(max, n));
@@ -104,7 +104,7 @@ function scoreCandidate(c) {
     ...c,
     score: { total, onchain, social, team, timing },
     why: whyLine({ ...c, score: { total } }),
-    activeStageKey: (c.stages || [])[0]?.label || (c.stages || [])[0]?.stage_type || (c.isMinting ? 'live' : null)
+    activeStageKey: activeStageKey(c)
   };
 }
 

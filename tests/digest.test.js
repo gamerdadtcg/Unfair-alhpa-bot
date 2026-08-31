@@ -19,4 +19,5 @@ test('digest is a single ranked list in trader voice', () => {
   assert.match(d.text, /Chain: ETH/);
   assert.match(d.text, /Why:/);
   assert.match(d.text, /Contract:/);
+  assert.doesNotMatch(d.text, /\*\*/);
 });

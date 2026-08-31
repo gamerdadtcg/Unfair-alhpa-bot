@@ -34,3 +34,23 @@ test('repeat mint is skipped after being posted', () => {
 test('missing contract is rejected', () => {
   assert.equal(hardReject({ ...good, contractAddress: null }), 'no contract address');
 });
+
+test('same collection can return after 18h if mint stage changed', () => {
+  const { record } = require('../src/store');
+  const item = {
+    ...repeat,
+    contractAddress: '0x5555555555555555555555555555555555555555',
+    slug: 'stage-shift'
+  };
+  record(item, {
+    last_posted_at: new Date(Date.now() - 19 * 36e5).toISOString(),
+    score: 70,
+    stage: 'allowlist'
+  });
+  const scored = {
+    ...item,
+    score: { total: 71 },
+    stages: [{ label: 'Public', start_time: new Date().toISOString() }]
+  };
+  assert.equal(shouldSkipAsRepeat(scored), null);
+});
